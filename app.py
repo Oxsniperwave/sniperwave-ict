@@ -1,3 +1,10 @@
+import sys
+if sys.version_info >= (3, 12):
+    try:
+        import distutils
+    except ImportError:
+        import setuptools
+        sys.modules['distutils'] = setuptools.distutils
 import streamlit as st
 import pandas as pd
 import numpy as np
