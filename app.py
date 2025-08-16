@@ -5,6 +5,7 @@ if sys.version_info >= (3, 12):
     except ImportError:
         import setuptools
         sys.modules['distutils'] = setuptools.distutils
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -18,7 +19,37 @@ import pytz
 from datetime import datetime, timedelta
 import threading
 from queue import Queue
+import calendar
 import base64
+
+def init_session():
+    """Initialize session state variables"""
+    if 'engine' not in st.session_state:
+        st.session_state.engine = SessionContextEngine()
+    
+    if 'trade_journal' not in st.session_state:
+        st.session_state.trade_journal = []
+    
+    if 'risk_params' not in st.session_state:
+        st.session_state.risk_params = {
+            'account_size': 10000,
+            'risk_percent': 1,
+            'entry': None,
+            'stop_loss': None,
+            'take_profit': None
+        }
+    
+    if 'dark_mode' not in st.session_state:
+        st.session_state.dark_mode = False
+    
+    if 'chat_messages' not in st.session_state:
+        st.session_state.chat_messages = [
+            {"role": "assistant", "content": "Hello! I'm your professional trading analysis assistant. How can I help you analyze the market today?"}
+        ]
+    
+    # Start WebSocket connection if not already running
+    if not st.session_state.engine.running:
+        st.session_state.engine.start_websocket()
 
 def init_dark_mode():
     """Initialize dark mode with custom CSS"""
@@ -145,6 +176,42 @@ def init_dark_mode():
                 background-color: #4a90e2;
                 color: white;
             }
+            .calendar-day {
+                border: 1px solid #333;
+                border-radius: 4px;
+                padding: 5px;
+                margin: 2px;
+                text-align: center;
+                cursor: pointer;
+                transition: all 0.2s;
+            }
+            .calendar-day:hover {
+                background-color: #2d2d2d;
+            }
+            .calendar-day.has-trades {
+                background-color: #4a90e2;
+                color: white;
+            }
+            .calendar-day.today {
+                border: 2px solid #4a90e2;
+            }
+            .calendar-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 10px;
+            }
+            .calendar-grid {
+                display: grid;
+                grid-template-columns: repeat(7, 1fr);
+                gap: 5px;
+            }
+            .calendar-day-name {
+                text-align: center;
+                font-weight: bold;
+                padding: 5px;
+                color: #a0a0a0;
+            }
         </style>
         """, unsafe_allow_html=True)
     else:
@@ -163,37 +230,44 @@ def init_dark_mode():
                 border-radius: 8px;
                 overflow: hidden;
             }
+            .calendar-day {
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                padding: 5px;
+                margin: 2px;
+                text-align: center;
+                cursor: pointer;
+                transition: all 0.2s;
+            }
+            .calendar-day:hover {
+                background-color: #f0f0f0;
+            }
+            .calendar-day.has-trades {
+                background-color: #4a90e2;
+                color: white;
+            }
+            .calendar-day.today {
+                border: 2px solid #4a90e2;
+            }
+            .calendar-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 10px;
+            }
+            .calendar-grid {
+                display: grid;
+                grid-template-columns: repeat(7, 1fr);
+                gap: 5px;
+            }
+            .calendar-day-name {
+                text-align: center;
+                font-weight: bold;
+                padding: 5px;
+                color: #666;
+            }
         </style>
         """, unsafe_allow_html=True)
-
-def init_session():
-    """Initialize session state variables"""
-    if 'engine' not in st.session_state:
-        st.session_state.engine = SessionContextEngine()
-    
-    if 'trade_journal' not in st.session_state:
-        st.session_state.trade_journal = []
-    
-    if 'risk_params' not in st.session_state:
-        st.session_state.risk_params = {
-            'account_size': 10000,
-            'risk_percent': 1,
-            'entry': None,
-            'stop_loss': None,
-            'take_profit': None
-        }
-    
-    if 'dark_mode' not in st.session_state:
-        st.session_state.dark_mode = False
-    
-    if 'chat_messages' not in st.session_state:
-        st.session_state.chat_messages = [
-            {"role": "assistant", "content": "Hello! I'm your professional trading analysis assistant. How can I help you analyze the market today?"}
-        ]
-    
-    # Start WebSocket connection if not already running
-    if not st.session_state.engine.running:
-        st.session_state.engine.start_websocket()
 
 class SessionContextEngine:
     def __init__(self):
@@ -282,11 +356,13 @@ class SessionContextEngine:
             self.last_data_source = "connecting"
             return True
         except Exception as e:
+            print(f"❌ Failed to connect to Dukascopy: {str(e)}")
             self.last_data_source = "simulated"
             return False
 
     def on_dukascopy_open(self, ws):
         """Handle Dukascopy connection open"""
+        print("✅ Dukascopy WebSocket connection established")
         self.last_data_source = "dukascopy"
         self.message_queue.put(('status', 'dukascopy_connected'))
 
@@ -321,15 +397,18 @@ class SessionContextEngine:
             self.liquidity_pools = self.detect_liquidity_sweeps()
             
         except Exception as e:
+            print(f"❌ Error processing Dukascopy message: {str(e)}")
             self.last_data_source = "simulated"
 
     def on_dukascopy_error(self, ws, error):
         """Handle Dukascopy connection errors"""
+        print(f"❌ Dukascopy WebSocket error: {error}")
         self.last_data_source = "simulated"
         self.message_queue.put(('status', 'dukascopy_error'))
 
     def on_dukascopy_close(self, ws, close_status_code, close_msg):
         """Handle Dukascopy connection close"""
+        print(f"ℹ️ Dukascopy WebSocket closed: {close_status_code} - {close_msg}")
         self.last_data_source = "simulated"
         self.message_queue.put(('status', 'dukascopy_closed'))
 
@@ -373,15 +452,18 @@ class SessionContextEngine:
             return
             
         self.running = True
+        print("🔄 Starting WebSocket connection thread")
         
         def run_websocket():
             while self.running:
                 try:
                     # First try to connect to real data source
                     if self.connect_to_dukascopy():
+                        print("✅ Successfully connected to Dukascopy")
                         # If connected, wait for messages
                         time.sleep(60)
                     else:
+                        print("⚠️ Connection to Dukascopy failed, using simulated data")
                         # If connection failed, use simulated data
                         time.sleep(2)  # Update every 2 seconds
                         
@@ -395,6 +477,7 @@ class SessionContextEngine:
                         self.on_message(None, None)
                         
                 except Exception as e:
+                    print(f"❌ WebSocket thread error: {str(e)}")
                     time.sleep(5)  # Wait before retrying
         
         # Start the WebSocket thread
@@ -439,6 +522,7 @@ class SessionContextEngine:
             self.liquidity_pools = self.detect_liquidity_sweeps()
             
         except Exception as e:
+            print(f"❌ Error processing message: {str(e)}")
             self.message_queue.put(('error', str(e)))
 
     def stop_websocket(self):
@@ -446,6 +530,7 @@ class SessionContextEngine:
         self.running = False
         if self.ws:
             self.ws.close()
+        print("ℹ️ WebSocket connection stopped")
 
 def calculate_position_size(account_size, entry, stop_loss, risk_percent=1):
     """Calculate proper position size based on risk parameters"""
@@ -486,7 +571,7 @@ def render_tradingview_chart():
       <script type="text/javascript">
         new TradingView.widget({{
           "width": "100%",
-          "height": 600,
+          "height": 400,
           "symbol": "{symbol}",
           "interval": "15",
           "timezone": "Etc/UTC",
@@ -502,11 +587,103 @@ def render_tradingview_chart():
     </div>
     """
     
-    st.components.v1.html(tradingview_html, height=630)
+    st.components.v1.html(tradingview_html, height=430)
+
+def render_custom_chart():
+    """Render custom Plotly chart with session context and liquidity pools"""
+    st.subheader("Custom Analysis Chart")
+    
+    engine = st.session_state.engine
+    
+    if engine.data.empty:
+        st.info("Waiting for market data...")
+        return
+    
+    # Create figure
+    fig = make_subplots(rows=1, cols=1)
+    
+    # Add candlestick chart
+    fig.add_trace(go.Candlestick(
+        x=engine.data['timestamp'],
+        open=engine.data['open'],
+        high=engine.data['high'],
+        low=engine.data['low'],
+        close=engine.data['close'],
+        name='Price'
+    ))
+    
+    # Add session background colors
+    if engine.current_session and engine.session_start_time:
+        fig.add_vrect(
+            x0=engine.session_start_time,
+            x1=engine.data['timestamp'].max(),
+            fillcolor={
+                'asia': 'rgba(128, 128, 128, 0.1)',
+                'london': 'rgba(76, 175, 80, 0.1)',
+                'ny': 'rgba(156, 39, 176, 0.1)',
+                'close': 'rgba(244, 67, 54, 0.1)'
+            }.get(engine.current_session, 'rgba(0, 0, 0, 0.1)'),
+            line_width=0,
+            annotation_text=engine.current_session.upper() + " SESSION",
+            annotation_position="top left",
+            annotation_font_size=12,
+            annotation_font_color="white",
+            annotation_bgcolor="rgba(0,0,0,0.5)",
+            row=1, col=1
+        )
+    
+    # Add session high/low lines
+    if engine.session_high and engine.session_low:
+        fig.add_hline(y=engine.session_high, line_dash="dot", line_color="green", 
+                     annotation_text="Session High", annotation_position="right",
+                     row=1, col=1)
+        fig.add_hline(y=engine.session_low, line_dash="dot", line_color="red",
+                     annotation_text="Session Low", annotation_position="right",
+                     row=1, col=1)
+    
+    # Add liquidity pools
+    for pool in engine.liquidity_pools:
+        color = 'green' if pool['type'] == 'bullish' else 'red'
+        fig.add_hline(
+            y=pool['price'], 
+            line_dash="dash", 
+            line_color=color,
+            annotation_text=f"Liquidity Pool ({pool['strength']}/10)",
+            annotation_position="right",
+            row=1, col=1
+        )
+    
+    # Update layout
+    fig.update_layout(
+        title=f"{engine.symbol} - Custom Session Context Analysis",
+        xaxis_rangeslider_visible=False,
+        height=400,
+        hovermode="x unified",
+        template="plotly_white",
+        margin=dict(l=10, r=10, t=50, b=10)
+    )
+    
+    fig.update_xaxes(title_text="Time (UTC)", row=1, col=1)
+    fig.update_yaxes(title_text="Price", row=1, col=1)
+    
+    # Add data source indicator
+    data_source_text = "Real data from Dukascopy (free tier)" if engine.last_data_source == "dukascopy" else "Simulated data - for testing only"
+    fig.add_annotation(
+        xref="paper", yref="paper",
+        x=0.5, y=1.05,
+        text=data_source_text,
+        showarrow=False,
+        font=dict(size=12, color="blue" if engine.last_data_source == "dukascopy" else "orange"),
+        bgcolor="rgba(255,255,255,0.8)",
+        bordercolor="blue" if engine.last_data_source == "dukascopy" else "orange",
+        borderpad=4
+    )
+    
+    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': True})
 
 def render_analysis_chatbot():
-    """Render a chatbot interface for requesting market analysis"""
-    st.subheader("Market Analysis Chatbot")
+    """Render a robust chatbot interface for market analysis that works with available data"""
+    st.subheader("AI Market Analysis Assistant")
     
     # Display chat messages
     for message in st.session_state.chat_messages:
@@ -530,9 +707,20 @@ def render_analysis_chatbot():
             full_response = ""
             
             # Generate response based on the prompt
-            with st.spinner("Analyzing chart..."):
-                response = generate_analysis_response(prompt)
-                full_response = response
+            with st.spinner("Analyzing market data..."):
+                # Check if we have sufficient data
+                if st.session_state.engine.data.empty:
+                    full_response = "I'm waiting for market data to load. Please give it a moment to connect to the data source."
+                else:
+                    # Check if we have enough data for meaningful analysis
+                    if len(st.session_state.engine.data) < 5:
+                        full_response = (f"I have limited data ({len(st.session_state.engine.data)} candles). "
+                                        "For better analysis, wait for more data to load (10+ candles recommended).\n\n"
+                                        "In the meantime, I can tell you:\n"
+                                        f"- Current session: {st.session_state.engine.current_session or 'N/A'}\n"
+                                        f"- Current price: {st.session_state.engine.data['close'].iloc[-1]:.5f}")
+                    else:
+                        full_response = generate_analysis_response(prompt)
             
             message_placeholder.markdown(full_response)
         
@@ -540,14 +728,13 @@ def render_analysis_chatbot():
         st.session_state.chat_messages.append({"role": "assistant", "content": full_response})
 
 def generate_analysis_response(prompt):
-    """Generate appropriate analysis response based on user prompt"""
+    """Generate appropriate analysis response based on user prompt with robust error handling"""
     engine = st.session_state.engine
     
-    # Basic validation
-    if engine.data.empty:
-        return ("I need market data to provide analysis. Please wait a moment for the chart to load.")
+    # Basic validation - we know we have data since this is checked in render_analysis_chatbot
+    current_price = engine.data['close'].iloc[-1]
     
-    # Process different types of requests
+    # Process different types of requests with robust error handling
     prompt_lower = prompt.lower()
     
     # Session context questions
@@ -572,516 +759,301 @@ def generate_analysis_response(prompt):
     
     # Help/feature questions
     elif any(keyword in prompt_lower for keyword in ["help", "what can you do", "features", "capabilities"]):
-        return """I can provide professional analysis of the current market conditions including:
+        return get_help_response()
+    
+    # Default response for unclear requests
+    else:
+        return get_default_response()
 
-1. **Session Context Analysis**
-   - Current trading session and institutional timing
-   - Session high/low significance
-   - Optimal timing for entries based on institutional flow
+def get_help_response():
+    """Return help information about what the AI can do"""
+    return """I'm your professional market analysis assistant. I can help with:
 
-2. **Liquidity Structure Analysis**
-   - Identification of significant liquidity pools
-   - Institutional order block assessment
-   - Liquidity grab prediction
+🔍 **Session Context Analysis**
+- Current trading session and institutional timing
+- Session high/low significance
+- Optimal timing for entries based on institutional flow
 
-3. **Trade Setup Assessment**
-   - Entry, stop loss, and take profit recommendations
-   - Risk-reward ratio calculation
-   - Position sizing based on account parameters
+💧 **Liquidity Structure Analysis**
+- Identification of liquidity pools
+- Institutional order block assessment
+- Liquidity grab prediction
 
-4. **Market Regime Assessment**
-   - Trending vs. ranging market identification
-   - Volatility assessment
-   - Technical structure analysis
+🎯 **Trade Setup Assessment**
+- Entry, stop loss, and take profit recommendations
+- Risk-reward ratio calculation
+- Position sizing based on account parameters
 
-Try asking specific questions like:
+📊 **Market Regime Assessment**
+- Trending vs. ranging market identification
+- Volatility assessment
+- Technical structure analysis
+
+Try asking:
 - 'What's the current session context?'
 - 'Are there any significant liquidity pools visible?'
 - 'What trade opportunities do you see right now?'
 - 'Is the market trending or ranging?'
 - 'Show me potential entry points for long positions'"""
 
-    # Default response for unclear requests
-    else:
-        return ("I can help analyze various aspects of the market including:\n\n"
-                "- Current trading session context and institutional timing\n"
-                "- Liquidity pool identification and significance\n"
-                "- Trade setup opportunities with entry/exit parameters\n"
-                "- Market regime assessment (trending vs ranging)\n"
-                "- Technical structure analysis\n\n"
-                "Try asking something like:\n"
-                "- 'What's the current session context?'\n"
-                "- 'Are there any significant liquidity pools visible?'\n"
-                "- 'What trade opportunities do you see right now?'\n"
-                "- 'Is the market trending or ranging?'\n"
-                "- 'Show me potential entry points for long positions'")
+def get_default_response():
+    """Return a helpful default response for unclear requests"""
+    return ("I can help analyze various aspects of the market. Try asking specific questions like:\n\n"
+            "• 'What's the current session context?'\n"
+            "• 'Are there any significant liquidity pools visible?'\n"
+            "• 'What trade opportunities do you see right now?'\n"
+            "• 'Is the market trending or ranging?'\n"
+            "• 'Show me potential entry points for long positions'\n\n"
+            "For more guidance, type 'help' to see what I can do.")
 
 def generate_session_analysis(engine):
-    """Generate analysis of current session context"""
-    if engine.data.empty:
-        return "No market data available for analysis."
-    
+    """Generate robust session context analysis that works with available data"""
     current_time = datetime.now(pytz.utc)
     current_hour = current_time.hour
-    current_session = engine.current_session
+    current_session = engine.current_session or "asia"  # Default to asia if not determined
     
-    # Get current price
+    # Get current price with fallback
     current_price = engine.data['close'].iloc[-1]
     
-    # Session timing analysis
+    # Create session analysis with robust fallbacks
+    analysis = "**Current Session Context Analysis**\n\n"
+    
+    # Basic session information
+    analysis += f"- **Current Session:** {current_session.upper() if current_session else 'UNKNOWN'}\n"
+    analysis += f"- **Current Time:** {current_time.strftime('%H:%M')} UTC\n"
+    
+    # Session-specific analysis with fallbacks
     if current_session == 'london':
         if 8 <= current_hour < 10:
-            return f"""**Early London Session Analysis (08:00-10:00 UTC)**
-
-- Asian session range has been established with high of {engine.session_high:.5f} and low of {engine.session_low:.5f}
-- Institutional participation is gradually increasing as London traders come online
-- The market is currently testing the Asian range boundaries - watch for breakout confirmation
-- Price is at {current_price:.5f}, which is {(current_price - engine.session_low) / (engine.session_high - engine.session_low) * 100:.1f}% through the Asian range
-- Optimal time for identifying initial directional bias for the London session
-
-*Recommendation:* Wait for clear breakout from Asian range with volume confirmation before entering trades."""
-        
+            analysis += "- Early London session: Asian range establishment still in effect\n"
+            analysis += "- Institutional participation gradually increasing\n"
         elif 10 <= current_hour <= 13:
-            session_range = engine.session_high - engine.session_low
-            price_from_high = (engine.session_high - current_price) / session_range
-            price_from_low = (current_price - engine.session_low) / session_range
-            
-            return f"""**Prime London Session Analysis (10:00-13:00 UTC)**
-
-- 78% of the typical London session range has been established
-- Institutional order flow is strong and directional
-- Price has moved {price_from_high * 100:.1f}% from session high ({engine.session_high:.5f})
-- Liquidity is abundant with tight spreads
-- Current price: {current_price:.5f}
-
-*Recommendation:* Look for pullback entries in the direction of the trend with tight stops. This is the highest probability period for directional moves. If price breaks above {engine.session_high:.5f}, expect a move toward {engine.session_high + session_range * 0.5:.5f}."""
-        
+            analysis += "- Prime London session: Highest probability period for directional moves\n"
+            analysis += "- 78% of daily London session range typically established by 13:00 UTC\n"
         elif 13 < current_hour <= 16:
-            return f"""**London/NY Overlap Session Analysis (13:00-16:00 UTC)**
-
-- Highest volatility period (42% of daily volatility)
-- Liquidity most abundant but directional clarity may decrease
-- London session high: {engine.session_high:.5f} | London session low: {engine.session_low:.5f}
-- Current price: {current_price:.5f}
-- Price is {(current_price - engine.session_low) / (engine.session_high - engine.session_low) * 100:.1f}% through the London session range
-
-*Recommendation:* Watch for London session high/low holds as key reference points. Optimal for momentum trades with tight risk parameters. Be prepared for potential reversal as London session winds down."""
-        
+            analysis += "- London/NY overlap: Highest volatility period (42% of daily volatility)\n"
+            analysis += "- Liquidity most abundant but directional clarity may decrease\n"
         else:
-            return f"""**Late London Session Analysis (16:00-16:30 UTC)**
-
-- Institutional participation declining as London session ends
-- Session high: {engine.session_high:.5f} | Session low: {engine.session_low:.5f}
-- Current price: {current_price:.5f}
-- Only {18 - current_hour} hours remaining in the trading day
-
-*Recommendation:* Watch for potential reversal patterns near session extremes. False breakouts increase as liquidity dries up. Not optimal for new entries without strong confirmation. Consider closing positions before the NY session close."""
+            analysis += "- Late London session: Institutional participation declining\n"
+            analysis += "- Watch for potential reversal patterns near session extremes\n"
     
     elif current_session == 'ny':
         if 13 <= current_hour < 15:
-            return f"""**Early NY Session Analysis (13:00-15:00 UTC)**
-
-- Overlap with London provides best directional clarity
-- 65% of NY session range typically established in first 2 hours
-- Institutional order flow strongest during overlap period
-- Current price: {current_price:.5f}
-- Session high: {engine.session_high:.5f} | Session low: {engine.session_low:.5f}
-
-*Recommendation:* Look for trend continuation with proper risk management. This is the optimal time for trend continuation entries with proper confirmation."""
-        
+            analysis += "- Early NY session: Overlap with London provides best directional clarity\n"
+            analysis += "- 65% of NY session range typically established in first 2 hours\n"
         elif 15 <= current_hour <= 18:
-            return f"""**Prime NY Session Analysis (15:00-18:00 UTC)**
-
-- Post-London volatility decline but directional bias often persists
-- Watch for continuation of London-established trend
-- Current price: {current_price:.5f}
-- Session high: {engine.session_high:.5f} | Session low: {engine.session_low:.5f}
-
-*Recommendation:* Optimal for counter-trend entries with tight stops if London range holds. Watch for continuation of London-established trend."""
-        
+            analysis += "- Prime NY session: Post-London volatility decline but directional bias persists\n"
+            analysis += "- Watch for continuation of London-established trend\n"
         else:
-            return f"""**Late NY Session Analysis (18:00-21:00 UTC)**
-
-- Liquidity declining significantly after 18:00 UTC
-- False breakouts increase as market approaches close
-- Current price: {current_price:.5f}
-- Session high: {engine.session_high:.5f} | Session low: {engine.session_low:.5f}
-
-*Recommendation:* Optimal for closing positions rather than new entries. Watch for potential overnight gap risk. Avoid new entries within 30 minutes of session close."""
+            analysis += "- Late NY session: Liquidity declining significantly after 18:00 UTC\n"
+            analysis += "- False breakouts increase as market approaches close\n"
     
     elif current_session == 'asia':
         if 0 <= current_hour < 4:
-            return f"""**Early Asian Session Analysis (00:00-04:00 UTC)**
-
-- Lowest liquidity period of the day
-- Range-bound price action typical (72% of Asian session)
-- Current price: {current_price:.5f}
-- Session high: {engine.session_high:.5f} | Session low: {engine.session_low:.5f}
-
-*Recommendation:* False breakouts extremely common. Not optimal for directional trading. Monitor for early range boundaries."""
-        
+            analysis += "- Early Asian session: Lowest liquidity period of the day\n"
+            analysis += "- Range-bound price action typical (72% of Asian session)\n"
         elif 4 <= current_hour <= 7:
-            return f"""**Prime Asian Session Analysis (04:00-07:00 UTC)**
-
-- Tokyo session influence most pronounced
-- 58% of Asian session range typically established by 07:00 UTC
-- Current price: {current_price:.5f}
-- Session high: {engine.session_high:.5f} | Session low: {engine.session_low:.5f}
-
-*Recommendation:* Watch for potential early directional bias formation. Optimal for identifying early range boundaries. Monitor for breakout levels for London session."""
-        
+            analysis += "- Prime Asian session: Tokyo session influence most pronounced\n"
+            analysis += "- 58% of Asian session range typically established by 07:00 UTC\n"
         else:
-            return f"""**Late Asian Session Analysis (07:00-08:00 UTC)**
-
-- Transition period to London session
-- Watch for early London session positioning
-- Current price: {current_price:.5f}
-- Session high: {engine.session_high:.5f} | Session low: {engine.session_low:.5f}
-
-*Recommendation:* False breakouts common as market tests Asian range. Optimal for identifying potential London session breakout levels. Prepare for London session open."""
+            analysis += "- Late Asian session: Transition period to London session\n"
+            analysis += "- Watch for early London session positioning\n"
     
     else:
-        return f"""**Market Session Analysis**
-
-- Current time: {current_time.strftime('%H:%M')} UTC
-- No active trading session (between sessions)
-- Current price: {current_price:.5f}
-
-*Recommendation:* Market typically consolidates between sessions. Avoid new entries until next session establishes direction. Monitor for early positioning as next session approaches."""
+        analysis += "- No active trading session: Market typically consolidates between sessions\n"
+        analysis += "- Avoid new entries until next session establishes direction\n"
+    
+    # Add session high/low if available
+    if engine.session_high and engine.session_low:
+        analysis += f"\n- **Session Range:** {engine.session_low:.5f} - {engine.session_high:.5f}\n"
+        analysis += f"- **Current Price:** {current_price:.5f}\n"
+        price_position = (current_price - engine.session_low) / (engine.session_high - engine.session_low) * 100
+        analysis += f"- **Price Position:** {price_position:.1f}% through session range\n"
+    
+    # Add professional recommendation
+    analysis += "\n**Professional Recommendation:**\n"
+    
+    if current_session in ['london', 'ny'] and 10 <= current_hour <= 15:
+        analysis += "- Prime institutional hours - optimal for trade entries with confirmation\n"
+    else:
+        analysis += "- Suboptimal timing for new entries - monitor for developing structure\n"
+    
+    analysis += "- Always confirm with price action before entering trades\n"
+    analysis += "- Watch for key session high/low holds as reference points\n"
+    
+    return analysis
 
 def generate_liquidity_analysis(engine):
-    """Generate analysis of liquidity structure"""
-    if engine.data.empty:
-        return "No market data available for analysis."
-    
-    # Get current price
+    """Generate robust liquidity analysis that works with limited data"""
     current_price = engine.data['close'].iloc[-1]
     
-    # Detect liquidity pools
-    liquidity_pools = engine.detect_liquidity_sweeps()
-    significant_pools = [p for p in liquidity_pools if p['strength'] >= 7]
+    analysis = "**Liquidity Structure Analysis**\n\n"
     
-    if not engine.session_high or not engine.session_low:
-        return """**Liquidity Structure Analysis**
-
-Session context is still forming. Wait for the session to establish its high and low before liquidity analysis becomes meaningful.
-
-*Recommendation:* Monitor for the establishment of session high and low. Key levels to watch:
-- Initial range boundaries
-- Previous session close
-- Daily pivot points
-
-Check back once the session has been active for 30+ minutes for a more detailed liquidity analysis."""
-
-    if not significant_pools:
-        return f"""**Liquidity Structure Analysis**
-
-No significant liquidity pools have been identified in the current session. The market appears to be in a neutral phase without clear institutional order blocks.
-
-*Current Session Context:*
-- Session high: {engine.session_high:.5f}
-- Session low: {engine.session_low:.5f}
-- Current price: {current_price:.5f}
-- Price position: {(current_price - engine.session_low) / (engine.session_high - engine.session_low) * 100:.1f}% through session range
-
-*Recommendation:* Monitor for developing liquidity structures as the session progresses. Key levels to watch:
-- Session high: {engine.session_high:.5f} (Institutional resistance)
-- Session low: {engine.session_low:.5f} (Institutional support)
-- 20-period SMA: {engine.data['close'].rolling(20).mean().iloc[-1]:.5f} (Dynamic support/resistance)
-
-Look for price reactions at these levels which may indicate emerging liquidity structures."""
-
-    # Format the liquidity pool analysis
-    analysis = "**Significant Liquidity Pools Identified**\n\n"
+    # Detect liquidity pools with error handling
+    try:
+        liquidity_pools = engine.detect_liquidity_sweeps()
+        significant_pools = [p for p in liquidity_pools if p['strength'] >= 5]  # Lower threshold for limited data
+    except Exception as e:
+        liquidity_pools = []
+        significant_pools = []
+        analysis += f"⚠️ Error detecting liquidity pools: {str(e)}\n\n"
     
-    for i, pool in enumerate(significant_pools, 1):
-        distance = abs(current_price - pool['price']) / pool['price'] * 100
-        pool_type = "Bullish" if pool['type'] == 'bullish' else "Bearish"
+    # Session high/low analysis
+    if engine.session_high and engine.session_low:
+        session_range = engine.session_high - engine.session_low
+        price_from_high = (engine.session_high - current_price) / session_range
+        price_from_low = (current_price - engine.session_low) / session_range
         
-        analysis += f"{i}. **{pool_type} Liquidity Pool at {pool['price']:.5f}** (Strength: {pool['strength']}/10)\n"
-        analysis += f"   - Distance from current price: {distance:.2f}%\n"
+        analysis += f"- **Session High:** {engine.session_high:.5f}\n"
+        analysis += f"- **Session Low:** {engine.session_low:.5f}\n"
+        analysis += f"- **Current Price:** {current_price:.5f}\n"
         
-        if distance < 0.05:
-            analysis += "   - *Price is currently testing this liquidity pool*\n"
-            analysis += "   - Requires price action confirmation before trading\n"
-        elif distance < 0.2:
-            analysis += "   - *Price is approaching this liquidity pool*\n"
-            analysis += "   - Watch for reaction as price nears this level\n"
+        if price_from_high < 0.1:
+            analysis += "- Price near session high - watch for liquidity grab above high\n"
+        elif price_from_low < 0.1:
+            analysis += "- Price near session low - watch for liquidity grab below low\n"
         else:
-            analysis += "   - *Price is distant from this liquidity pool*\n"
-            analysis += "   - May become relevant if price moves in this direction\n"
-        
-        analysis += "\n"
-    
-    analysis += """**Trading Implications**\n\n"""
-    
-    if current_price > engine.session_high * 0.999:
-        analysis += f"- Price is near session high ({engine.session_high:.5f}) - watch for liquidity grab above high before potential reversal\n"
-    elif current_price < engine.session_low * 1.001:
-        analysis += f"- Price is near session low ({engine.session_low:.5f}) - watch for liquidity grab below low before potential reversal\n"
+            analysis += "- Price in mid-session range - watch for directional breakout\n"
     else:
-        analysis += "- Price is in mid-session range - watch for directional breakout\n"
+        analysis += "- Session high/low not yet established\n"
+        analysis += "- Monitor for developing session structure\n\n"
     
-    analysis += "- Liquidity pools represent institutional order blocks where stops are likely clustered\n"
-    analysis += "- Trading with the liquidity sweep (not against it) increases probability of success\n"
-    
-    # Add specific trade recommendation if price is near a pool
+    # Liquidity pool analysis
     if significant_pools:
-        closest_pool = min(significant_pools, key=lambda x: abs(x['price'] - current_price))
-        distance = abs(current_price - closest_pool['price']) / closest_pool['price'] * 100
+        analysis += f"\n- **{len(significant_pools)} significant liquidity pools identified**\n"
         
-        if distance < 0.2:
-            if closest_pool['type'] == 'bullish':
-                analysis += f"\n**Trade Recommendation:**\n"
-                analysis += f"- *Potential long opportunity* near bullish liquidity pool at {closest_pool['price']:.5f}\n"
-                analysis += f"- Entry: {closest_pool['price'] * 1.0001:.5f}\n"
-                analysis += f"- Stop loss: {closest_pool['price'] * 0.9998:.5f}\n"
-                analysis += f"- Take profit: {closest_pool['price'] + (closest_pool['price'] - engine.session_low) * 2.0:.5f}\n"
-                analysis += "- Confirmation: Bullish candlestick pattern at entry zone"
-            else:
-                analysis += f"\n**Trade Recommendation:**\n"
-                analysis += f"- *Potential short opportunity* near bearish liquidity pool at {closest_pool['price']:.5f}\n"
-                analysis += f"- Entry: {closest_pool['price'] * 0.9999:.5f}\n"
-                analysis += f"- Stop loss: {closest_pool['price'] * 1.0002:.5f}\n"
-                analysis += f"- Take profit: {closest_pool['price'] - (engine.session_high - closest_pool['price']) * 2.0:.5f}\n"
-                analysis += "- Confirmation: Bearish candlestick pattern at entry zone"
+        for i, pool in enumerate(significant_pools[:3], 1):  # Show up to 3 pools
+            distance = abs(current_price - pool['price']) / pool['price'] * 100
+            pool_type = "Bullish" if pool['type'] == 'bullish' else "Bearish"
+            
+            analysis += f"\n{i}. **{pool_type} Liquidity Pool at {pool['price']:.5f}**\n"
+            analysis += f"   - Strength: {pool['strength']}/10\n"
+            analysis += f"   - Distance: {distance:.2f}% from current price\n"
+            
+            if distance < 5:
+                analysis += "   - *Price near this liquidity pool*\n"
+    
+    else:
+        analysis += "\n- No significant liquidity pools identified yet\n"
+        analysis += "- This is normal with limited data or during consolidation\n"
+    
+    # Trading implications
+    analysis += "\n**Trading Implications:**\n"
+    
+    if engine.session_high and engine.session_low and significant_pools:
+        analysis += "- Trade with the liquidity sweep (not against it)\n"
+        analysis += "- Enter trades after price confirms direction at liquidity pools\n"
+        analysis += "- Use session high/low as reference points for risk management\n"
+    else:
+        analysis += "- Monitor for developing liquidity structures\n"
+        analysis += "- Wait for clear session high/low establishment\n"
+        analysis += "- Look for price reactions at round numbers as temporary reference points\n"
     
     return analysis
 
 def generate_trade_setup_analysis(engine):
-    """Generate trade setup analysis based on current market conditions"""
-    if engine.data.empty:
-        return "No market data available for analysis."
-    
-    # Get current price
+    """Generate robust trade setup analysis with conservative recommendations"""
     current_price = engine.data['close'].iloc[-1]
     
-    # Calculate key technical metrics
-    sma_20 = engine.data['close'].rolling(20).mean().iloc[-1] if len(engine.data) >= 20 else None
-    sma_50 = engine.data['close'].rolling(50).mean().iloc[-1] if len(engine.data) >= 50 else None
-    atr = engine.data['high'].rolling(14).max() - engine.data['low'].rolling(14).min()
-    current_atr = atr.iloc[-1] if len(atr) > 0 else None
+    # Calculate technical indicators with error handling
+    sma_20 = None
+    sma_50 = None
     
-    # Session context
-    current_session = engine.current_session
-    current_hour = datetime.now(pytz.utc).hour
+    try:
+        if len(engine.data) >= 20:
+            sma_20 = engine.data['close'].rolling(20).mean().iloc[-1]
+        if len(engine.data) >= 50:
+            sma_50 = engine.data['close'].rolling(50).mean().iloc[-1]
+    except:
+        pass
     
-    # Get liquidity pools
-    liquidity_pools = engine.detect_liquidity_sweeps()
-    significant_pools = [p for p in liquidity_pools if p['strength'] >= 7]
+    # Detect liquidity pools
+    try:
+        liquidity_pools = engine.detect_liquidity_sweeps()
+        significant_pools = [p for p in liquidity_pools if p['strength'] >= 5]
+    except:
+        liquidity_pools = []
+        significant_pools = []
     
-    # Market regime analysis
+    # Determine market regime
     market_regime = "RANGING"
     if sma_20 and sma_50 and sma_20 > sma_50 and current_price > sma_20:
         market_regime = "BULLISH TREND"
     elif sma_20 and sma_50 and sma_20 < sma_50 and current_price < sma_20:
         market_regime = "BEARISH TREND"
     
-    # Determine optimal trade direction
-    bullish_signals = 0
-    bearish_signals = 0
+    # Generate analysis
+    analysis = "**Trade Setup Analysis**\n\n"
     
-    # Bullish setup conditions
-    if market_regime == "BULLISH TREND" and sma_20 and current_price > sma_20:
-        bullish_signals += 3
-    if engine.session_low and (current_price - engine.session_low) / (engine.session_high - engine.session_low) < 0.25:
-        bullish_signals += 2
-    if significant_pools and any(p['type'] == 'bullish' and abs(current_price - p['price'])/p['price'] < 0.002 for p in significant_pools):
-        bullish_signals += 3
-    if current_session in ['london', 'ny'] and 10 <= current_hour <= 15:
-        bullish_signals += 2
+    # Market regime
+    analysis += f"- **Current Market Regime:** {market_regime}\n"
     
-    # Bearish setup conditions
-    if market_regime == "BEARISH TREND" and sma_20 and current_price < sma_20:
-        bearish_signals += 3
-    if engine.session_high and (engine.session_high - current_price) / (engine.session_high - engine.session_low) < 0.25:
-        bearish_signals += 2
-    if significant_pools and any(p['type'] == 'bearish' and abs(current_price - p['price'])/p['price'] < 0.002 for p in significant_pools):
-        bearish_signals += 3
-    if current_session in ['london', 'ny'] and 10 <= current_hour <= 15:
-        bearish_signals += 2
-    
-    # Generate trade recommendations
-    if bullish_signals >= 5 and bullish_signals > bearish_signals + 1:
-        # Entry strategy
-        if sma_20 and current_price > sma_20:
-            entry = max(current_price, sma_20)
-        elif significant_pools:
-            bullish_pools = [p for p in significant_pools if p['type'] == 'bullish']
-            if bullish_pools:
-                deepest_pool = min(bullish_pools, key=lambda x: x['price'])
-                entry = deepest_pool['price'] * 1.0001
-            else:
-                entry = current_price * 1.00005
+    # Technical indicators
+    if sma_20:
+        analysis += f"- **20-period SMA:** {sma_20:.5f}\n"
+        if market_regime == "BULLISH TREND":
+            analysis += "- Price above 20-period SMA - bullish bias\n"
+        elif market_regime == "BEARISH TREND":
+            analysis += "- Price below 20-period SMA - bearish bias\n"
         else:
-            entry = current_price * 1.00005
-        
-        # Stop loss placement
-        if engine.session_low and current_price > engine.session_low:
-            stop_distance = (current_price - engine.session_low) * 1.2
-            stop_loss = current_price - stop_distance
-        elif significant_pools:
-            bullish_pools = [p for p in significant_pools if p['type'] == 'bullish']
-            if bullish_pools:
-                deepest_pool = min(bullish_pools, key=lambda x: x['price'])
-                stop_distance = (current_price - deepest_pool['price']) * 1.5
-                stop_loss = deepest_pool['price'] * 0.9998
-            else:
-                stop_loss = current_price - (current_atr * 1.5) if current_atr else current_price * 0.999
-        else:
-            stop_loss = current_price - (current_atr * 1.5) if current_atr else current_price * 0.999
-        
-        # Take profit placement
-        if market_regime == "BULLISH TREND" and sma_20:
-            risk = entry - stop_loss
-            take_profit = entry + (risk * 2.5)
-        else:
-            risk = entry - stop_loss
-            take_profit = entry + (risk * 2.0)
-        
-        # Format the trade setup
-        setup_type = "Trend Continuation"
-        if market_regime == "BULLISH TREND" and engine.session_low and (current_price - engine.session_low) / (engine.session_high - engine.session_low) < 0.25:
-            setup_type = "Trend Pullback"
-        elif significant_pools and any(p['type'] == 'bullish' and abs(current_price - p['price'])/p['price'] < 0.002 for p in significant_pools):
-            setup_type = "Liquidity Grab Reversal"
-        
-        confidence = min(95, bullish_signals * 10)
-        
-        return f"""**LONG TRADE SETUP DETECTED | Confidence: {confidence}% | Setup Type: {setup_type}**
-
-**Entry Zone:** {entry:.5f}
-- Optimal entry: {entry:.5f} - {entry * 1.0002:.5f}
-- Confirmation required: Bullish candlestick pattern at entry zone
-- Volume confirmation: Entry volume should exceed 20-period average
-
-**Stop Loss:** {stop_loss:.5f}
-- Initial stop placement based on liquidity structure
-- Move to breakeven when price reaches 1.5x risk
-- Trail stop at 1.0x ATR below price after 2.0x risk achieved
-
-**Take Profit:** {take_profit:.5f}
-- Primary target: 2.0-2.5x risk
-- Partial close: 50% position at 1.5x risk, remainder at full target
-- Extension target: 3.0x risk if price shows strong momentum
-
-**Risk Management:**
-- Maximum risk: 1% of account
-- Position size: Adjusted to maintain consistent dollar risk
-- No trading within 30 minutes of high-impact news events"""
-    
-    elif bearish_signals >= 5 and bearish_signals > bullish_signals + 1:
-        # Entry strategy
-        if sma_20 and current_price < sma_20:
-            entry = min(current_price, sma_20)
-        elif significant_pools:
-            bearish_pools = [p for p in significant_pools if p['type'] == 'bearish']
-            if bearish_pools:
-                highest_pool = max(bearish_pools, key=lambda x: x['price'])
-                entry = highest_pool['price'] * 0.9999
-            else:
-                entry = current_price * 0.99995
-        else:
-            entry = current_price * 0.99995
-        
-        # Stop loss placement
-        if engine.session_high and current_price < engine.session_high:
-            stop_distance = (engine.session_high - current_price) * 1.2
-            stop_loss = current_price + stop_distance
-        elif significant_pools:
-            bearish_pools = [p for p in significant_pools if p['type'] == 'bearish']
-            if bearish_pools:
-                highest_pool = max(bearish_pools, key=lambda x: x['price'])
-                stop_distance = (highest_pool['price'] - current_price) * 1.5
-                stop_loss = highest_pool['price'] * 1.0002
-            else:
-                stop_loss = current_price + (current_atr * 1.5) if current_atr else current_price * 1.001
-        else:
-            stop_loss = current_price + (current_atr * 1.5) if current_atr else current_price * 1.001
-        
-        # Take profit placement
-        if market_regime == "BEARISH TREND" and sma_20:
-            risk = stop_loss - entry
-            take_profit = entry - (risk * 2.5)
-        else:
-            risk = stop_loss - entry
-            take_profit = entry - (risk * 2.0)
-        
-        # Format the trade setup
-        setup_type = "Trend Continuation"
-        if market_regime == "BEARISH TREND" and engine.session_high and (engine.session_high - current_price) / (engine.session_high - engine.session_low) < 0.25:
-            setup_type = "Trend Rally"
-        elif significant_pools and any(p['type'] == 'bearish' and abs(current_price - p['price'])/p['price'] < 0.002 for p in significant_pools):
-            setup_type = "Liquidity Grab Reversal"
-        
-        confidence = min(95, bearish_signals * 10)
-        
-        return f"""**SHORT TRADE SETUP DETECTED | Confidence: {confidence}% | Setup Type: {setup_type}**
-
-**Entry Zone:** {entry:.5f}
-- Optimal entry: {entry:.5f} - {entry * 0.9998:.5f}
-- Confirmation required: Bearish candlestick pattern at entry zone
-- Volume confirmation: Entry volume should exceed 20-period average
-
-**Stop Loss:** {stop_loss:.5f}
-- Initial stop placement based on liquidity structure
-- Move to breakeven when price reaches 1.5x risk
-- Trail stop at 1.0x ATR above price after 2.0x risk achieved
-
-**Take Profit:** {take_profit:.5f}
-- Primary target: 2.0-2.5x risk
-- Partial close: 50% position at 1.5x risk, remainder at full target
-- Extension target: 3.0x risk if price shows strong momentum
-
-**Risk Management:**
-- Maximum risk: 1% of account
-- Position size: Adjusted to maintain consistent dollar risk
-- No trading within 30 minutes of high-impact news events"""
-    
+            analysis += "- Price near 20-period SMA - neutral bias\n"
     else:
-        return """**No High-Probability Trade Setup Detected**
-
-Current market conditions do not meet professional trading criteria. Analysis shows:
-
-"""
-        # Add specific reasons based on the signals
-        if bullish_signals < 5 and bearish_signals < 5:
-            response += "- No clear directional bias: Market lacks sufficient confluence for high-probability trade\n"
-            response += "- Neutral market structure: Price oscillating without clear institutional order flow\n"
-            response += "- Insufficient confirmation: Missing required technical and session context alignment\n\n"
-            response += "*Recommendation:* Monitor for developing structure; avoid premature entries."
+        analysis += "- Not enough data for 20-period SMA\n"
+    
+    # Session context
+    current_session = engine.current_session or "asia"
+    current_hour = datetime.now(pytz.utc).hour
+    
+    if current_session in ['london', 'ny'] and 10 <= current_hour <= 15:
+        analysis += "- Prime institutional hours - optimal for trade entries\n"
+    else:
+        analysis += "- Suboptimal timing for new entries\n"
+    
+    # Liquidity analysis
+    if significant_pools:
+        analysis += f"\n- **{len(significant_pools)} potential trade zones identified** at liquidity pools\n"
+    else:
+        analysis += "\n- No strong liquidity structures identified yet\n"
+    
+    # Conservative trade recommendations
+    analysis += "\n**Conservative Trade Recommendations:**\n"
+    
+    # Bullish opportunity
+    bullish_opportunity = False
+    if market_regime == "BULLISH TREND" and sma_20 and current_price > sma_20:
+        bullish_opportunity = True
+        analysis += "- Potential long opportunity on pullbacks to support\n"
+        analysis += f"  * Entry zone: {sma_20:.5f} - {current_price:.5f}\n"
+        analysis += f"  * Stop loss: Below {min(engine.session_low, sma_20 * 0.999) if engine.session_low else sma_20 * 0.999:.5f}\n"
+    
+    # Bearish opportunity
+    bearish_opportunity = False
+    if market_regime == "BEARISH TREND" and sma_20 and current_price < sma_20:
+        bearish_opportunity = True
+        analysis += "- Potential short opportunity on rallies to resistance\n"
+        analysis += f"  * Entry zone: {current_price:.5f} - {sma_20:.5f}\n"
+        analysis += f"  * Stop loss: Above {max(engine.session_high, sma_20 * 1.001) if engine.session_high else sma_20 * 1.001:.5f}\n"
+    
+    # Range-bound market
+    if not bullish_opportunity and not bearish_opportunity:
+        analysis += "- Market appears range-bound - consider fading extremes\n"
+        if engine.session_high and engine.session_low:
+            mid_point = (engine.session_high + engine.session_low) / 2
+            if current_price > mid_point:
+                analysis += f"  * Consider short near {engine.session_high:.5f} with stop above\n"
+            else:
+                analysis += f"  * Consider long near {engine.session_low:.5f} with stop below\n"
         else:
-            response += f"- Bullish signals: {bullish_signals}/10\n"
-            response += f"- Bearish signals: {bearish_signals}/10\n"
-            response += "- Conflicting market signals: Bullish and bearish factors are in equilibrium\n"
-            response += "- Indecisive market structure: Price lacks clear directional commitment\n\n"
-            response += "*Recommendation:* Maintain flat position until clearer structure emerges."
-        
-        response += """
-
-**Key Levels to Watch:**
-"""
-        if engine.session_high:
-            response += f"- Session High: {engine.session_high:.5f} (Institutional resistance)\n"
-        if engine.session_low:
-            response += f"- Session Low: {engine.session_low:.5f} (Institutional support)\n"
-        
-        for pool in significant_pools[:3]:  # Show up to 3 pools
-            pool_type = "Bullish" if pool['type'] == 'bullish' else "Bearish"
-            response += f"- {pool_type} Liquidity Pool: {pool['price']:.5f} (Strength: {pool['strength']}/10)\n"
-        
-        if sma_20:
-            response += f"- 20-period SMA: {sma_20:.5f} (Dynamic support/resistance)\n"
-        
-        response += """
-
-**Confirmation Requirements for Entry:**
-- Minimum 3 confluence factors required for trade consideration
-- Volume confirmation exceeding 20-period average
-- Price action confirmation (valid candlestick pattern)
-- Institutional time filter (08:00-16:00 UTC for optimal flow)"""
-
-        return response
+            analysis += "  * Wait for clearer range boundaries to form\n"
+    
+    # Risk management
+    analysis += "\n**Risk Management Protocol:**\n"
+    analysis += "- Risk only 1% of account per trade\n"
+    analysis += "- Use stop losses on every trade\n"
+    analysis += "- Target minimum 1:2 risk-reward ratio\n"
+    analysis += "- Confirm with price action before entering\n"
+    
+    return analysis
 
 def generate_technical_analysis(engine):
     """Generate technical analysis of current market structure"""
@@ -1422,9 +1394,91 @@ def render_risk_calculator():
         if actual_risk > account_size * 0.02:
             st.warning("Warning: Risk amount exceeds 2% of account. Consider reducing position size.")
 
-def render_trade_journal():
-    """Render trade journal with export functionality"""
-    st.subheader("Trade Journal")
+def render_trading_journal_calendar():
+    """Render trading journal with calendar view"""
+    st.subheader("Trading Journal Calendar")
+    
+    # Get current date
+    today = datetime.now().date()
+    
+    # Create a calendar for the current month
+    current_year = today.year
+    current_month = today.month
+    
+    # Get all trade dates
+    trade_dates = []
+    if st.session_state.trade_journal:
+        for trade in st.session_state.trade_journal:
+            trade_dates.append(trade['datetime'].date())
+    
+    # Create calendar grid
+    st.markdown('<div class="calendar-header">', unsafe_allow_html=True)
+    st.markdown(f'<h3>{calendar.month_name[current_month]} {current_year}</h3>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    # Day names
+    days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+    st.markdown('<div class="calendar-grid">', unsafe_allow_html=True)
+    for day in days:
+        st.markdown(f'<div class="calendar-day-name">{day}</div>', unsafe_allow_html=True)
+    
+    # Get the first day of the month
+    first_day = datetime(current_year, current_month, 1)
+    # Get the weekday of the first day (0 = Monday, 6 = Sunday)
+    first_weekday = first_day.weekday()
+    
+    # Fill in empty days before the first day
+    for _ in range(first_weekday):
+        st.markdown('<div class="calendar-day"></div>', unsafe_allow_html=True)
+    
+    # Get number of days in the month
+    _, num_days = calendar.monthrange(current_year, current_month)
+    
+    # Create calendar days
+    for day in range(1, num_days + 1):
+        day_date = datetime(current_year, current_month, day).date()
+        has_trades = day_date in trade_dates
+        is_today = day_date == today
+        
+        classes = ["calendar-day"]
+        if has_trades:
+            classes.append("has-trades")
+        if is_today:
+            classes.append("today")
+        
+        if has_trades:
+            st.markdown(f'<div class="{" ".join(classes)}" title="Trades today">{day}</div>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div class="{" ".join(classes)}">{day}</div>', unsafe_allow_html=True)
+    
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    # Show trades for selected date
+    st.subheader("Recent Trades")
+    
+    # Filter to show only recent trades (last 7 days)
+    recent_trades = []
+    if st.session_state.trade_journal:
+        seven_days_ago = datetime.now() - timedelta(days=7)
+        recent_trades = [t for t in st.session_state.trade_journal if t['datetime'] > seven_days_ago]
+        recent_trades = sorted(recent_trades, key=lambda x: x['datetime'], reverse=True)
+    
+    if recent_trades:
+        # Convert to DataFrame for display
+        journal_df = pd.DataFrame(recent_trades)
+        journal_df = journal_df.sort_values('datetime', ascending=False)
+        
+        # Format the display
+        display_df = journal_df.copy()
+        display_df['datetime'] = display_df['datetime'].dt.strftime('%Y-%m-%d %H:%M')
+        display_df['P&L'] = "N/A"  # Would calculate if we had exit prices
+        
+        st.dataframe(
+            display_df[['datetime', 'symbol', 'direction', 'entry', 'sl', 'tp', 'status', 'P&L']],
+            use_container_width=True
+        )
+    else:
+        st.info("No recent trades recorded. Add your first trade in the Trade Journal tab.")
     
     # Add new trade form
     with st.expander("➕ Add New Trade"):
@@ -1464,24 +1518,14 @@ def render_trade_journal():
             st.success("Trade saved to journal!")
             st.experimental_rerun()
     
-    # Display trade history
+    # Export option
     if st.session_state.trade_journal:
-        # Convert to DataFrame for display
-        journal_df = pd.DataFrame(st.session_state.trade_journal)
-        journal_df = journal_df.sort_values('datetime', ascending=False)
-        
-        # Format the display
-        display_df = journal_df.copy()
-        display_df['datetime'] = display_df['datetime'].dt.strftime('%Y-%m-%d %H:%M')
-        display_df['P&L'] = "N/A"  # Would calculate if we had exit prices
-        
-        st.dataframe(
-            display_df[['datetime', 'symbol', 'direction', 'entry', 'sl', 'tp', 'status', 'P&L']],
-            use_container_width=True
-        )
-        
-        # Export option
         if st.button("Export Journal as CSV"):
+            journal_df = pd.DataFrame(st.session_state.trade_journal)
+            journal_df = journal_df.sort_values('datetime', ascending=False)
+            journal_df['datetime'] = journal_df['datetime'].dt.strftime('%Y-%m-%d %H:%M')
+            journal_df['P&L'] = "N/A"
+            
             csv = journal_df.to_csv(index=False)
             st.download_button(
                 label="Download CSV",
@@ -1489,8 +1533,6 @@ def render_trade_journal():
                 file_name="trade_journal.csv",
                 mime="text/csv"
             )
-    else:
-        st.info("No trades recorded yet. Add your first trade above!")
 
 def main():
     """Main application entry point"""
@@ -1498,25 +1540,8 @@ def main():
         page_title="ICT Analysis",
         page_icon="📊",
         layout="wide",
-        initial_sidebar_state="collapsed"
+        initial_sidebar_state="expanded"
     )
-    
-    # Initialize dark mode toggle in sidebar
-    with st.sidebar:
-        st.markdown("### Display Settings")
-        dark_mode = st.toggle("Dark Mode", value=st.session_state.get('dark_mode', False))
-        st.session_state.dark_mode = dark_mode
-        
-        st.markdown("---")
-        st.markdown("### Session Settings")
-        refresh_btn = st.button("Refresh Data")
-        if refresh_btn:
-            st.experimental_rerun()
-        
-        st.markdown("---")
-        st.markdown("### About")
-        st.markdown("ICT Session Context Tool v2.0")
-        st.markdown("Professional trading analysis platform")
     
     # Initialize session state
     init_session()
@@ -1528,6 +1553,34 @@ def main():
     engine = st.session_state.engine
     while not engine.message_queue.empty():
         msg_type, content = engine.message_queue.get()
+    
+    # Create sidebar with AI assistant
+    with st.sidebar:
+        st.markdown("### AI Trading Assistant")
+        st.markdown("Ask me about market structure, liquidity pools, or trading opportunities.")
+        
+        st.markdown("---")
+        
+        # AI assistant chat in sidebar
+        for message in st.session_state.chat_messages[-3:]:  # Show last 3 messages
+            with st.container():
+                if message["role"] == "user":
+                    st.markdown(f"**You:** {message['content'][:30]}{'...' if len(message['content']) > 30 else ''}")
+                else:
+                    st.markdown(f"**Assistant:** {message['content'][:30]}{'...' if len(message['content']) > 30 else ''}")
+        
+        st.markdown("---")
+        
+        st.markdown("### About")
+        st.markdown("ICT Session Context Tool v2.0")
+        st.markdown("Professional trading analysis platform")
+        
+        # Add a dark mode toggle in the sidebar
+        st.toggle("Dark Mode", value=st.session_state.dark_mode, key="dark_mode_toggle", 
+                 on_change=lambda: st.session_state.update(dark_mode=st.session_state.dark_mode_toggle))
+    
+    # Main content
+    st.title("📊 ICT Session Context Analysis Tool")
     
     # Status indicators at the top
     col1, col2, col3, col4 = st.columns(4)
@@ -1555,21 +1608,95 @@ def main():
             st.metric("Data Status", status)
     
     # Main tabs
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab2, tab3, tab4 = st.tabs([
         "Analysis", 
         "Risk Calculator", 
-        "Trade Journal"
+        "Trade Journal",
+        "Calendar View"
     ])
     
     with tab1:
-        render_tradingview_chart()
+        col1, col2 = st.columns(2)
+        with col1:
+            render_tradingview_chart()
+        
+        with col2:
+            render_custom_chart()
+        
         render_analysis_chatbot()
     
     with tab2:
         render_risk_calculator()
     
     with tab3:
-        render_trade_journal()
+        # Add new trade form
+        with st.expander("➕ Add New Trade"):
+            col1, col2 = st.columns(2)
+            with col1:
+                trade_symbol = st.text_input("Symbol", value="EUR/USD", key="trade_symbol_tab3")
+                trade_direction = st.selectbox("Direction", ["Long", "Short"])
+            
+            with col2:
+                trade_date = st.date_input("Date", value=datetime.now().date())
+                trade_time = st.time_input("Time", value=datetime.now().time())
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                entry_price = st.number_input("Entry Price", format="%.5f", step=0.0001, key="entry_price_tab3")
+            
+            with col2:
+                sl_price = st.number_input("Stop Loss", format="%.5f", step=0.0001, key="sl_price_tab3")
+            
+            with col3:
+                tp_price = st.number_input("Take Profit", format="%.5f", step=0.0001, key="tp_price_tab3")
+            
+            reason = st.text_area("Trade Reason / Setup")
+            
+            if st.button("Save Trade", type="primary"):
+                new_trade = {
+                    'datetime': datetime.combine(trade_date, trade_time),
+                    'symbol': trade_symbol,
+                    'direction': trade_direction,
+                    'entry': entry_price,
+                    'sl': sl_price,
+                    'tp': tp_price,
+                    'reason': reason,
+                    'status': 'open'
+                }
+                st.session_state.trade_journal.append(new_trade)
+                st.success("Trade saved to journal!")
+                st.experimental_rerun()
+        
+        # Display trade history
+        if st.session_state.trade_journal:
+            # Convert to DataFrame for display
+            journal_df = pd.DataFrame(st.session_state.trade_journal)
+            journal_df = journal_df.sort_values('datetime', ascending=False)
+            
+            # Format the display
+            display_df = journal_df.copy()
+            display_df['datetime'] = display_df['datetime'].dt.strftime('%Y-%m-%d %H:%M')
+            display_df['P&L'] = "N/A"  # Would calculate if we had exit prices
+            
+            st.dataframe(
+                display_df[['datetime', 'symbol', 'direction', 'entry', 'sl', 'tp', 'status', 'P&L']],
+                use_container_width=True
+            )
+            
+            # Export option
+            if st.button("Export Journal as CSV"):
+                csv = journal_df.to_csv(index=False)
+                st.download_button(
+                    label="Download CSV",
+                    data=csv,
+                    file_name="trade_journal.csv",
+                    mime="text/csv"
+                )
+        else:
+            st.info("No trades recorded yet. Add your first trade above!")
+    
+    with tab4:
+        render_trading_journal_calendar()
     
     # Footer
     st.markdown("""
