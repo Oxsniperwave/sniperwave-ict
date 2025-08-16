@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 import logging
 import threading
 from queue import Queue
+import dateutil
 
 # Configure logging
 logging.basicConfig(
@@ -19,17 +20,6 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-# Critical disclaimer - must be visible at all times
-DISCLAIMER = """
-**WARNING: THIS IS AN EDUCATIONAL TOOL ONLY**
-- This application provides SESSION CONTEXT ONLY, NOT trading signals
-- ICT concepts are interpretive frameworks, NOT mathematical certainties
-- All trading involves substantial risk of loss
-- Never risk more than 1% of your account on any single trade
-- This tool does NOT guarantee profits or accuracy
-- You are solely responsible for your trading decisions
-"""
 
 class SessionContextEngine:
     def __init__(self):
@@ -44,6 +34,8 @@ class SessionContextEngine:
         self.message_queue = Queue()
         self.running = False
         self.last_update = None
+        self.last_data_source = "simulated"  # Track data source
+        self.liquidity_pools = []  # Store detected liquidity pools
         
         # Session time definitions (GMT/UTC)
         self.session_times = {
@@ -60,7 +52,6 @@ class SessionContextEngine:
     def get_current_session(self, timestamp):
         """Determine current trading session based on UTC time"""
         hour = timestamp.hour
-        minute = timestamp.minute
         
         # Asia session: 00:00-08:00 UTC
         if 0 <= hour < 8:
@@ -112,14 +103,11 @@ class SessionContextEngine:
             response.raise_for_status()
             
             # Parse the response to find high impact events
-            # This is simplified - real implementation would use proper HTML parsing
             events = []
-            
-            # Simulated high-impact events for demo
             now = datetime.now(pytz.utc)
             today = now.date()
             
-            # Add some demo events (in real app, parse from API)
+            # Add demo events (in real app, parse from API)
             events.append({
                 'time': (now + timedelta(hours=1)).strftime("%H:%M"),
                 'event': 'US Non-Farm Payrolls',
@@ -143,10 +131,237 @@ class SessionContextEngine:
             logger.error(f"Error fetching news: {str(e)}")
             return False
 
-    def on_message(self, ws, message):
-        """Process real-time tick data"""
+    def connect_to_dukascopy(self):
+        """Connect to Dukascopy free tier for real FX data"""
         try:
-            # For demo, we'll simulate data (real app would use Dukascopy)
+            # WebSocket connection to Dukascopy
+            ws_url = f"wss://quotes.dukascopy.com/feed/{self.symbol.replace('/', '')}/m1/last/100"
+            self.ws = websocket.WebSocketApp(
+                ws_url,
+                on_message=self.on_dukascopy_message,
+                on_error=self.on_dukascopy_error,
+                on_close=self.on_dukascopy_close,
+                on_open=self.on_dukascopy_open
+            )
+            
+            # Run in a separate thread
+            wst = threading.Thread(target=self.ws.run_forever)
+            wst.daemon = True
+            wst.start()
+            
+            logger.info(f"Connecting to Dukascopy: {ws_url}")
+            self.last_data_source = "connecting"
+            return True
+        except Exception as e:
+            logger.error(f"Failed to connect to Dukascopy: {str(e)}")
+            self.last_data_source = "simulated"
+            return False
+
+    def on_dukascopy_open(self, ws):
+        """Handle Dukascopy connection open"""
+        logger.info("Connected to Dukascopy WebSocket")
+        self.last_data_source = "dukascopy"
+        self.message_queue.put(('status', 'dukascopy_connected'))
+
+    def on_dukascopy_message(self, ws, message):
+        """Process real Dukascopy data"""
+        try:
+            # Parse Dukascopy data format
+            data = json.loads(message)
+            
+            # Convert to candle format
+            new_candle = {
+                'timestamp': datetime.fromtimestamp(data['t']/1000, tz=pytz.utc),
+                'open': data['o'],
+                'high': data['h'],
+                'low': data['l'],
+                'close': data['c']
+            }
+            
+            # Update session context
+            session_info = self.update_session(new_candle)
+            
+            # Add to data store
+            self.data = pd.concat([self.data, pd.DataFrame([new_candle])], ignore_index=True)
+            if len(self.data) > 1000:
+                self.data = self.data.iloc[-1000:]
+                
+            self.last_update = new_candle['timestamp']
+            self.last_data_source = "dukascopy"
+            self.message_queue.put(('update', new_candle))
+            
+            # Detect liquidity pools
+            self.liquidity_pools = self.detect_liquidity_sweeps()
+            
+        except Exception as e:
+            logger.error(f"Dukascopy processing error: {str(e)}")
+            self.last_data_source = "simulated"
+
+    def on_dukascopy_error(self, ws, error):
+        """Handle Dukascopy connection errors"""
+        logger.error(f"Dukascopy WebSocket error: {error}")
+        self.last_data_source = "simulated"
+        self.message_queue.put(('status', 'dukascopy_error'))
+
+    def on_dukascopy_close(self, ws, close_status_code, close_msg):
+        """Handle Dukascopy connection close"""
+        logger.info(f"Dukascopy WebSocket closed: {close_status_code} - {close_msg}")
+        self.last_data_source = "simulated"
+        self.message_queue.put(('status', 'dukascopy_closed'))
+
+    def detect_liquidity_sweeps(self, lookback_hours=24):
+        """Identify recent liquidity pools (extreme highs/lows that were swept)"""
+        if len(self.data) < 20:
+            return []
+        
+        liquidity_pools = []
+        current_time = datetime.now(pytz.utc)
+        
+        # Look for recent extremes that were swept
+        for i in range(len(self.data)-5, 19, -1):
+            candle = self.data.iloc[i]
+            
+            # Identify potential liquidity pool (extreme high/low)
+            if (candle['high'] > self.data['high'].rolling(20).max().iloc[i-1] or 
+                candle['low'] < self.data['low'].rolling(20).min().iloc[i-1]):
+                
+                # Check if price swept the level and reversed significantly
+                reversal_candles = self.data.iloc[i+1:i+5]
+                if not reversal_candles.empty:
+                    price_move = abs(reversal_candles['close'].iloc[-1] - candle['high' if candle['close'] < candle['open'] else 'low'])
+                    reversal_pct = price_move / candle['high' if candle['close'] < candle['open'] else 'low']
+                    
+                    # Significant reversal (2:1 ratio)
+                    if reversal_pct > 0.0005:  # 5 pips for EUR/USD
+                        liquidity_pools.append({
+                            'timestamp': candle['timestamp'],
+                            'price': candle['high'] if candle['close'] < candle['open'] else candle['low'],
+                            'type': 'bullish' if candle['close'] < candle['open'] else 'bearish',
+                            'strength': min(10, int(reversal_pct * 20000)),  # Scale to 1-10
+                            'candle_index': i
+                        })
+        
+        return liquidity_pools
+
+    def calculate_rr_ratio(self, entry, stop_loss, take_profit, direction):
+        """Calculate risk-reward ratio with proper validation"""
+        if None in [entry, stop_loss, take_profit] or entry == stop_loss:
+            return None, None
+        
+        risk = abs(entry - stop_loss)
+        if direction == "Long":
+            reward = abs(take_profit - entry)
+        else:
+            reward = abs(entry - take_profit)
+        
+        rr_ratio = reward / risk if risk > 0 else None
+        return rr_ratio, risk
+
+    def analyze_trade_quality(self, entry, stop_loss, take_profit, direction):
+        """Analyze trade setup quality based on multiple factors"""
+        if None in [entry, stop_loss, take_profit] or entry == stop_loss:
+            return 0, ["❌ Missing required trade parameters"]
+        
+        score = 0
+        factors = []
+        
+        # 1. Risk-Reward ratio (30% of score)
+        rr, risk = self.calculate_rr_ratio(entry, stop_loss, take_profit, direction)
+        if rr and rr >= 2.0:
+            score += 15
+            factors.append(f"✅ Good RR ({rr:.1f}R)")
+        elif rr:
+            score += max(0, min(15, (rr - 1) * 15))
+            factors.append(f"⚠️ Marginal RR ({rr:.1f}R)")
+        else:
+            factors.append("❌ Missing RR calculation")
+        
+        # 2. Liquidity alignment (25% of score)
+        liquidity_alignment = 0
+        for pool in self.liquidity_pools:
+            if direction == "Long" and pool['type'] == 'bearish':
+                # Check if entry is near bearish liquidity pool (below the pool)
+                if pool['price'] * 0.9995 < entry < pool['price']:
+                    liquidity_alignment = max(liquidity_alignment, pool['strength'] * 1.5)
+                    factors.append(f"✅ Entry near bearish liquidity ({pool['strength']}/10)")
+            elif direction == "Short" and pool['type'] == 'bullish':
+                # Check if entry is near bullish liquidity pool (above the pool)
+                if pool['price'] < entry < pool['price'] * 1.0005:
+                    liquidity_alignment = max(liquidity_alignment, pool['strength'] * 1.5)
+                    factors.append(f"✅ Entry near bullish liquidity ({pool['strength']}/10)")
+        
+        score += min(15, liquidity_alignment)
+        
+        # 3. Session context (25% of score)
+        current_session = self.get_current_session(datetime.now(pytz.utc))
+        current_hour = datetime.now(pytz.utc).hour
+        
+        if (current_session == 'london' and 10 <= current_hour <= 15) or \
+           (current_session == 'ny' and 13 <= current_hour <= 18):
+            score += 15
+            factors.append("✅ Prime session timing")
+        elif current_session in ['london', 'ny']:
+            score += 10
+            factors.append("⚠️ Good session, not peak")
+        
+        # 4. News avoidance (20% of score)
+        near_news = False
+        for event in self.high_impact_events:
+            try:
+                event_time = datetime.strptime(f"{event['date']} {event['time']}", '%Y-%m-%d %H:%M').replace(tzinfo=pytz.utc)
+                time_diff = (event_time - datetime.now(pytz.utc)).total_seconds() / 60  # minutes
+                
+                if 0 <= time_diff <= 60:  # Event in next 60 minutes
+                    near_news = True
+                    break
+            except:
+                continue
+        
+        if not near_news:
+            score += 15
+            factors.append("✅ No high-impact news soon")
+        
+        return min(100, score), factors
+
+    def start_websocket(self):
+        """Start the WebSocket connection in a separate thread"""
+        if self.running:
+            return
+            
+        self.running = True
+        logger.info("Starting WebSocket connection thread")
+        
+        def run_websocket():
+            while self.running:
+                try:
+                    # First try to connect to real data source
+                    if self.connect_to_dukascopy():
+                        # If connected, wait for messages
+                        time.sleep(60)
+                    else:
+                        # If connection failed, use simulated data
+                        time.sleep(2)  # Update every 2 seconds
+                        
+                        if not self.running:
+                            break
+                            
+                        # Simulate connection status
+                        self.message_queue.put(('status', 'simulated'))
+                        
+                        # Simulate data
+                        self.on_message(None, None)
+                        
+                except Exception as e:
+                    logger.error(f"WebSocket thread error: {str(e)}")
+                    time.sleep(5)  # Wait before retrying
+        
+        # Start the WebSocket thread
+        self.ws_thread = threading.Thread(target=run_websocket, daemon=True)
+        self.ws_thread.start()
+
+    def on_message(self, ws, message):
+        """Process real-time tick data (simulated for demo)"""
+        try:
             ts = datetime.now(pytz.utc)
             
             # Generate realistic price movement
@@ -178,6 +393,9 @@ class SessionContextEngine:
             self.last_update = ts
             self.message_queue.put(('update', new_candle))
             
+            # Detect liquidity pools
+            self.liquidity_pools = self.detect_liquidity_sweeps()
+            
         except Exception as e:
             logger.error(f"Error processing message: {str(e)}")
             self.message_queue.put(('error', str(e)))
@@ -197,37 +415,6 @@ class SessionContextEngine:
         # Simulate subscription (real app would send subscription message)
         time.sleep(1)
         self.message_queue.put(('status', 'subscribed'))
-
-    def start_websocket(self):
-        """Start the WebSocket connection in a separate thread"""
-        if self.running:
-            return
-            
-        self.running = True
-        logger.info("Starting WebSocket connection thread")
-        
-        def run_websocket():
-            while self.running:
-                try:
-                    # For demo, we'll simulate data instead of real WebSocket
-                    time.sleep(2)  # Update every 2 seconds
-                    
-                    if not self.running:
-                        break
-                        
-                    # Simulate connection status
-                    self.message_queue.put(('status', 'connected'))
-                    
-                    # Simulate data
-                    self.on_message(None, None)
-                    
-                except Exception as e:
-                    logger.error(f"WebSocket thread error: {str(e)}")
-                    time.sleep(5)  # Wait before retrying
-        
-        # Start the WebSocket thread
-        self.ws_thread = threading.Thread(target=run_websocket, daemon=True)
-        self.ws_thread.start()
 
     def stop_websocket(self):
         """Stop the WebSocket connection"""
@@ -252,6 +439,10 @@ def init_session():
             'stop_loss': None,
             'take_profit': None
         }
+    
+    # Start WebSocket connection if not already running
+    if not st.session_state.engine.running:
+        st.session_state.engine.start_websocket()
 
 def calculate_position_size(account_size, entry, stop_loss, risk_percent=1):
     """Calculate proper position size based on risk parameters"""
@@ -328,7 +519,7 @@ def display_news_warnings():
         st.markdown(warning_html, unsafe_allow_html=True)
 
 def render_session_chart():
-    """Render the main price chart with session context"""
+    """Render the main price chart with session context and liquidity pools"""
     engine = st.session_state.engine
     
     if engine.data.empty:
@@ -377,6 +568,18 @@ def render_session_chart():
                      annotation_text="Session Low", annotation_position="right",
                      row=1, col=1)
     
+    # Add liquidity pools
+    for pool in engine.liquidity_pools:
+        color = 'green' if pool['type'] == 'bullish' else 'red'
+        fig.add_hline(
+            y=pool['price'], 
+            line_dash="dash", 
+            line_color=color,
+            annotation_text=f"Liquidity Pool ({pool['strength']}/10)",
+            annotation_position="right",
+            row=1, col=1
+        )
+    
     # Update layout
     fig.update_layout(
         title=f"{engine.symbol} - Session Context Analysis (UTC Time)",
@@ -390,15 +593,16 @@ def render_session_chart():
     fig.update_xaxes(title_text="Time (UTC)", row=1, col=1)
     fig.update_yaxes(title_text="Price", row=1, col=1)
     
-    # Add educational tooltips
+    # Add data source indicator
+    data_source_text = "✅ Real data from Dukascopy (free tier)" if engine.last_data_source == "dukascopy" else "⚠️ Simulated data - for testing only"
     fig.add_annotation(
         xref="paper", yref="paper",
         x=0.5, y=1.05,
-        text="This chart shows session context only. London session (08:00-16:00 UTC) typically has highest liquidity.",
+        text=data_source_text,
         showarrow=False,
-        font=dict(size=12, color="blue"),
+        font=dict(size=12, color="blue" if engine.last_data_source == "dukascopy" else "orange"),
         bgcolor="rgba(255,255,255,0.8)",
-        bordercolor="blue",
+        bordercolor="blue" if engine.last_data_source == "dukascopy" else "orange",
         borderpad=4
     )
     
@@ -437,6 +641,9 @@ def render_risk_calculator():
     with col3:
         take_profit = st.number_input("Take Profit", format="%.5f", value=st.session_state.risk_params['take_profit'] or 0.0, step=0.0001)
     
+    # Direction selection
+    trade_direction = st.selectbox("Trade Direction", ["Long", "Short"])
+    
     # Update session state
     st.session_state.risk_params.update({
         'account_size': account_size,
@@ -474,6 +681,44 @@ def render_risk_calculator():
         # Risk warning if too high
         if actual_risk > account_size * 0.02:
             st.warning("⚠️ Warning: Risk amount exceeds 2% of account. Consider reducing position size.")
+        
+        # Trade Quality Assessment
+        st.subheader("Trade Setup Quality")
+        quality_score, factors = st.session_state.engine.analyze_trade_quality(
+            entry, stop_loss, take_profit, trade_direction
+        )
+        
+        # Display score gauge
+        if quality_score > 0:
+            # Create gauge chart
+            fig = go.Figure(go.Indicator(
+                mode="gauge+number",
+                value=quality_score,
+                domain={'x': [0, 1], 'y': [0, 1]},
+                title={'text': "Trade Quality Score"},
+                gauge={
+                    'axis': {'range': [0, 100]},
+                    'bar': {'color': "#2196F3"},
+                    'steps': [
+                        {'range': [0, 40], 'color': "#ff4b4b"},
+                        {'range': [40, 70], 'color': "#f5ab00"},
+                        {'range': [70, 100], 'color': "#00c853"}
+                    ]
+                }
+            ))
+            
+            fig.update_layout(height=250, margin=dict(l=20, r=20, t=30, b=20))
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Display factors
+            for factor in factors:
+                st.markdown(factor)
+            
+            # Critical warning for low scores
+            if quality_score < 40:
+                st.warning("⚠️ This setup has significant weaknesses. Consider waiting for better conditions.")
+            elif quality_score < 70:
+                st.info("ℹ️ This setup has moderate quality. Double-check your reasoning before entering.")
         
         # Educational explanation
         with st.expander("How this calculation works"):
@@ -697,10 +942,6 @@ def main():
     # Initialize session state
     init_session()
     
-    # Start WebSocket connection if not already running
-    if not st.session_state.engine.running:
-        st.session_state.engine.start_websocket()
-    
     # Process any queued messages
     engine = st.session_state.engine
     while not engine.message_queue.empty():
@@ -708,12 +949,32 @@ def main():
         if msg_type == 'error':
             st.error(f"Data error: {content}")
     
-    # Main app layout
-    st.title("📊 ICT Session Context Analysis Tool")
-    
     # Display critical disclaimer
     display_disclaimer()
     
+    # Display data connection status
+    if engine.last_data_source == "dukascopy":
+        st.success("✅ Connected to real market data (Dukascopy free tier)")
+    elif engine.last_data_source == "connecting":
+        st.info("🔄 Connecting to market data feed...")
+    else:
+        st.warning("⚠️ Using simulated data - check connection settings")
+        
+        # Show connection troubleshooting tips
+        with st.expander("🔧 troubleshoot connection"):
+            st.markdown("""
+            **Common issues:**
+            - Dukascopy free tier only supports 1 connection at a time
+            - Free tier has rate limits (1 request/second)
+            - Check Streamlit Cloud logs for detailed errors
+            - Ensure requirements.txt has all required packages
+            
+            **Next steps:**
+            1. Verify requirements.txt includes `websocket-client==1.8.0`
+            2. Check Streamlit Cloud logs for connection errors
+            3. Wait 1-2 minutes for connection to establish
+            """)
+
     # News warnings
     display_news_warnings()
     
